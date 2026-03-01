@@ -1,0 +1,12 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+examples/02_connect_stream.pl
+lib/Linux/Event/Connect.pm
+t/00-load.t
+t/01-validate.t
+t/02-connect-refused.t
+t/03-cancel.t
+t/09-stress-many-refused.t
+t/10-gai-failure.t
