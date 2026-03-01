@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        perl: ['5.36', '5.38', '5.40', '5.42']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: ${{ matrix.perl }}
+      - name: Install dependencies
+        run: |
+          cpanm --notest --quiet --installdeps .
+      - name: Build
+        run: |
+          perl Makefile.PL
+          make
+      - name: Test
+        run: |
+          make test

@@ -141,7 +141,7 @@ sub new ($class, %args) {
     my $h = $host;
     $h =~ s/\A[ \t\r\n]+//;
     $h =~ s/[ \t\r\n]+\z//;
-    if ($h =~ /\A\[(.*)\]\z/) { $h = $1 }
+    if (index($h, '[') == 0 && substr($h, -1) eq ']') { $h = substr($h, 1, -1) }
 
     my $p4 = inet_pton(AF_INET, $h);
     if (defined $p4) {
@@ -372,7 +372,6 @@ sub _finalize_err ($self, $errno) {
 1;
 
 __END__
-
 =head1 NAME
 
 Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
@@ -395,10 +394,13 @@ Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
 
     on_connect => sub ($req, $fh, $data) {
       # $fh is a connected nonblocking socket.
+      # You own the filehandle and must close it.
     },
 
     on_error => sub ($req, $errno, $data) {
       # Connect failed. $errno is numeric.
+      # $! is not modified; set it if you want a message.
+      #   local $! = $errno;
     },
   );
 
@@ -406,84 +408,180 @@ Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
 
 =head1 DESCRIPTION
 
-Linux::Event::Connect provides a minimal nonblocking outbound connect primitive
-for Linux::Event.
+Linux::Event::Connect performs an outbound TCP or Unix-domain connect using a
+nonblocking socket and a Linux::Event watcher.
 
-Host/port mode uses an IP literal fast-path (no getaddrinfo). Hostname
-resolution uses getaddrinfo synchronously and may block. For strict nonblocking
-behavior, use sockaddr mode.
+This module is intentionally small:
+
+=over 4
+
+=item * One request object per connect attempt
+
+The request manages the nonblocking socket, a write-watch while the connect is
+in progress, and an optional timeout.
+
+=item * No hidden globals
+
+All state is carried by the request object.
+
+=item * Composable
+
+On success you receive a connected filehandle which can be wrapped by
+L<Linux::Event::Stream> (if you use it) or watched directly with
+C<< $loop->watch(...) >>.
+
+=back
 
 =head1 CONSTRUCTOR
 
-=head2 new(%args)
+=head2 new
 
-Creates and starts the connect request immediately. Unknown keys are fatal.
+  my $req = Linux::Event::Connect->new(%args);
 
-Exactly one address mode is required:
+Creates and starts a connect request immediately. Unknown keys are fatal.
+
+=head3 Common options
 
 =over 4
 
-=item * host/port mode
+=item * loop (required)
+
+A Linux::Event loop instance.
+
+=item * on_connect (optional)
+
+  on_connect => sub ($req, $fh, $data) { ... }
+
+Invoked once when the socket is connected. The callback receives ownership of
+C<$fh> (it will not be closed by the request).
+
+=item * on_error (optional)
+
+  on_error => sub ($req, $errno, $data) { ... }
+
+Invoked once on failure with a numeric C<$errno>. The request will tear down its
+watcher/timeout and close any in-progress socket before calling C<on_error>.
+
+=item * data (optional)
+
+Arbitrary user data passed through to callbacks as the last argument.
+
+=item * timeout_s (optional)
+
+A numeric number of seconds. If set, the request fails with C<ETIMEDOUT> when
+the timeout expires.
+
+=item * nonblocking (optional)
+
+If provided, must be true. This module only supports nonblocking connects.
+
+=back
+
+=head3 Address modes
+
+Exactly one address mode is required.
+
+=head4 host/port mode
 
   host => $host, port => $port
 
-C<port> must be an integer in 0..65535.
+C<port> must be an integer in the range 0..65535.
 
-=item * unix mode
+If C<host> is an IPv4 or IPv6 literal, the address is packed directly and no
+resolver is invoked.
+
+If C<host> is a hostname, this module calls C<getaddrinfo> synchronously to
+produce one or more candidate sockaddrs. Synchronous resolution may block; see
+L</PERFORMANCE NOTES>.
+
+Keys forbidden in host/port mode: C<family>, C<sockaddr>, C<unix>, C<type>,
+C<proto>.
+
+=head4 unix mode
 
   unix => '/path/to.sock'
 
-=item * sockaddr mode
+Connects to a Unix-domain stream socket path.
 
-  sockaddr => $packed, family => $AF_*
+Keys forbidden in unix mode: C<host>, C<port>, C<sockaddr>, C<family>, C<type>,
+C<proto>.
 
-In sockaddr mode, C<family> is required and is not inferred.
+=head4 sockaddr mode
 
-=back
+  sockaddr => $packed_sockaddr, family => $AF_*
 
-Optional:
+Uses a caller-supplied packed sockaddr and explicit address family. In this mode
+C<family> is required and is not inferred.
 
-=over 4
-
-=item * timeout_s
-
-If set, fails with ETIMEDOUT when the timeout expires.
-
-=item * data
-
-User data passed to callbacks.
-
-=item * on_connect / on_error
-
-Callbacks invoked as:
-
-  on_connect($req, $fh, $data)
-  on_error($req, $errno, $data)
-
-=item * nonblocking
-
-Must be true if provided.
-
-=back
+Keys forbidden in sockaddr mode: C<host>, C<port>, C<unix>, C<type>, C<proto>.
 
 =head1 METHODS
 
 =head2 cancel
 
-Cancels a pending request. No callbacks are invoked.
+  $req->cancel;
 
-=head2 is_pending, is_done, fh, errno, gai_error
+Cancels a pending request. No callbacks are invoked. After cancel, the request
+is inert and will not perform further work.
+
+=head2 is_pending / is_done
+
+  my $bool = $req->is_pending;
+  my $bool = $req->is_done;
+
+Convenience accessors for the completion state.
+
+=head2 fh
+
+  my $fh = $req->fh;
+
+Returns the in-progress filehandle while the request is pending, or undef after
+completion/cancel.
+
+=head2 errno
+
+  my $errno = $req->errno;
+
+Returns the last error number seen by the request (most useful after failure).
+
+=head2 gai_error
+
+  my $str = $req->gai_error;
+
+If hostname resolution via C<getaddrinfo> fails, this returns a stored string
+describing the resolver failure.
+
+=head1 CALLBACK BEHAVIOR
+
+Callbacks are invoked at most once.
+
+Before invoking a callback, the request tears down its internal watcher and
+timeout. This prevents double-callbacks and keeps re-entrant loop activity safe.
 
 =head1 PERFORMANCE NOTES
 
-IP literals (IPv4 or IPv6) are detected via inet_pton and do not call
-getaddrinfo.
+=over 4
 
-Hostnames use synchronous getaddrinfo and may block.
+=item * IP literals avoid getaddrinfo
 
-For strictly nonblocking behavior in all cases, use sockaddr mode.
+IPv4/IPv6 literals are detected via C<inet_pton> and do not call C<getaddrinfo>.
 
-=cut
+=item * Hostnames may block
+
+Hostname resolution uses synchronous C<getaddrinfo> and may block. For strict
+nonblocking behavior in all cases, use sockaddr mode with a pre-resolved address
+or provide an IP literal in host/port mode.
+
+=item * Candidate fallback
+
+When multiple candidate sockaddrs are produced (for example, IPv6 then IPv4),
+Connect will try them in order until one connects or all fail.
+
+=back
+
+=head1 SEE ALSO
+
+L<Linux::Event>, L<Linux::Event::Stream>, L<Socket>
 
 =head1 LICENSE
 
