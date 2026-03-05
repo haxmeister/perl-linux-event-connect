@@ -372,15 +372,17 @@ sub _finalize_err ($self, $errno) {
 1;
 
 __END__
+
 =head1 NAME
 
-Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
+Linux::Event::Connect - Nonblocking outbound connect for Linux::Event
 
 =head1 SYNOPSIS
 
   use v5.36;
   use Linux::Event;
   use Linux::Event::Connect;
+  use Linux::Event::Stream;
 
   my $loop = Linux::Event->new;
 
@@ -393,14 +395,30 @@ Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
     timeout_s => 5,
 
     on_connect => sub ($req, $fh, $data) {
-      # $fh is a connected nonblocking socket.
-      # You own the filehandle and must close it.
+      # You own $fh. Stream is the canonical next layer.
+      Linux::Event::Stream->new(
+        loop => $loop,
+        fh   => $fh,
+
+        codec      => 'line',
+        on_message => sub ($stream, $line, $data) {
+          $stream->write_message("client: $line");
+        },
+
+        on_error => sub ($stream, $errno, $data) {
+          # fatal I/O error; stream will close
+        },
+
+        on_close => sub ($stream, $data) {
+          # closed
+        },
+      );
     },
 
     on_error => sub ($req, $errno, $data) {
-      # Connect failed. $errno is numeric.
-      # $! is not modified; set it if you want a message.
-      #   local $! = $errno;
+      # $errno is numeric; $! is not modified for you.
+      # local $! = $errno; warn "connect failed: $!\n";
+      warn "connect failed: $errno\n";
     },
   );
 
@@ -408,29 +426,56 @@ Linux::Event::Connect - Nonblocking outbound socket connect for Linux::Event
 
 =head1 DESCRIPTION
 
-Linux::Event::Connect performs an outbound TCP or Unix-domain connect using a
-nonblocking socket and a Linux::Event watcher.
+B<Linux::Event::Connect> performs an outbound connect using a nonblocking socket
+integrated with a L<Linux::Event> loop.
 
-This module is intentionally small:
+It is intentionally small and explicit:
 
 =over 4
 
 =item * One request object per connect attempt
 
-The request manages the nonblocking socket, a write-watch while the connect is
-in progress, and an optional timeout.
+The request manages the nonblocking socket, an internal watcher while the connect
+is in progress, and an optional timeout.
 
-=item * No hidden globals
+=item * Nonblocking-only semantics
 
-All state is carried by the request object.
+This module enforces nonblocking connect behavior and delivers completion via
+callbacks.
 
 =item * Composable
 
-On success you receive a connected filehandle which can be wrapped by
-L<Linux::Event::Stream> (if you use it) or watched directly with
-C<< $loop->watch(...) >>.
+On success you receive a connected filehandle and can wrap it in
+L<Linux::Event::Stream> or watch it directly with C<< $loop->watch(...) >>.
 
 =back
+
+=head1 LAYERING
+
+This distribution is part of a composable socket stack:
+
+=over 4
+
+=item * B<Linux::Event::Connect>
+
+Client-side socket acquisition: nonblocking outbound connect. Produces connected
+nonblocking filehandles.
+
+=item * B<Linux::Event::Listen>
+
+Server-side socket acquisition: bind + listen + accept. Produces accepted
+nonblocking filehandles.
+
+=item * B<Linux::Event::Stream>
+
+Buffered I/O + backpressure for an established filehandle (accepted or
+connected). Stream owns the filehandle and handles read/write buffering.
+
+=back
+
+Canonical composition:
+
+  Listen/Connect -> Stream -> (your protocol/codec/state)
 
 =head1 CONSTRUCTOR
 
@@ -440,80 +485,102 @@ C<< $loop->watch(...) >>.
 
 Creates and starts a connect request immediately. Unknown keys are fatal.
 
-=head3 Common options
+Required:
 
 =over 4
 
-=item * loop (required)
+=item * C<loop>
 
-A Linux::Event loop instance.
+A L<Linux::Event::Loop> instance.
 
-=item * on_connect (optional)
+=back
+
+Exactly one address mode is required (see L</ADDRESS MODES>).
+
+Optional:
+
+=over 4
+
+=item * C<on_connect>
 
   on_connect => sub ($req, $fh, $data) { ... }
 
-Invoked once when the socket is connected. The callback receives ownership of
-C<$fh> (it will not be closed by the request).
+Called once on success.
 
-=item * on_error (optional)
+=item * C<on_error>
 
   on_error => sub ($req, $errno, $data) { ... }
 
-Invoked once on failure with a numeric C<$errno>. The request will tear down its
-watcher/timeout and close any in-progress socket before calling C<on_error>.
+Called once on failure.
 
-=item * data (optional)
+=item * C<timeout_s>
 
-Arbitrary user data passed through to callbacks as the last argument.
+Seconds (integer or fractional). If set, the request fails with C<ETIMEDOUT> on
+timeout.
 
-=item * timeout_s (optional)
+=item * C<data>
 
-A numeric number of seconds. If set, the request fails with C<ETIMEDOUT> when
-the timeout expires.
+Opaque user data passed to callbacks as the last argument.
 
-=item * nonblocking (optional)
+=item * C<nonblocking>
 
 If provided, must be true. This module only supports nonblocking connects.
 
 =back
 
-=head3 Address modes
+=head1 ADDRESS MODES
 
-Exactly one address mode is required.
+Exactly one address mode must be used.
 
-=head4 host/port mode
+=head2 host / port (TCP)
 
-  host => $host, port => $port
+  host => $host,
+  port => $port,
 
-C<port> must be an integer in the range 0..65535.
-
-If C<host> is an IPv4 or IPv6 literal, the address is packed directly and no
-resolver is invoked.
+If C<host> is an IPv4/IPv6 literal, it is packed directly.
 
 If C<host> is a hostname, this module calls C<getaddrinfo> synchronously to
-produce one or more candidate sockaddrs. Synchronous resolution may block; see
-L</PERFORMANCE NOTES>.
+produce candidate addresses. This may block; see L</PERFORMANCE NOTES>.
 
-Keys forbidden in host/port mode: C<family>, C<sockaddr>, C<unix>, C<type>,
-C<proto>.
-
-=head4 unix mode
+=head2 unix (AF_UNIX)
 
   unix => '/path/to.sock'
 
-Connects to a Unix-domain stream socket path.
+Connect to a Unix domain stream socket path.
 
-Keys forbidden in unix mode: C<host>, C<port>, C<sockaddr>, C<family>, C<type>,
-C<proto>.
+=head2 sockaddr + explicit family
 
-=head4 sockaddr mode
+  sockaddr => $packed_sockaddr,
+  family   => $AF_*
 
-  sockaddr => $packed_sockaddr, family => $AF_*
+Use a caller-supplied sockaddr and an explicit address family.
 
-Uses a caller-supplied packed sockaddr and explicit address family. In this mode
-C<family> is required and is not inferred.
+=head1 CALLBACK CONTRACT
 
-Keys forbidden in sockaddr mode: C<host>, C<port>, C<unix>, C<type>, C<proto>.
+Callbacks are invoked at most once and have these signatures:
+
+=head2 on_connect
+
+  on_connect => sub ($req, $fh, $data) { ... }
+
+Called once on success.
+
+Ownership: you own C<$fh>. The request does not close it.
+
+Nonblocking: C<$fh> is nonblocking.
+
+After this callback runs, the request is complete and inert.
+
+=head2 on_error
+
+  on_error => sub ($req, $errno, $data) { ... }
+
+Called once on failure with numeric C<$errno>.
+
+The request has already torn down internal watchers/timers and closed any
+in-progress socket before calling C<on_error>.
+
+Note: C<$!> is not modified for you.
 
 =head1 METHODS
 
@@ -521,42 +588,39 @@ Keys forbidden in sockaddr mode: C<host>, C<port>, C<unix>, C<type>, C<proto>.
 
   $req->cancel;
 
-Cancels a pending request. No callbacks are invoked. After cancel, the request
-is inert and will not perform further work.
+Cancel a pending request. No callbacks are invoked. After cancel, the request is
+inert.
 
 =head2 is_pending / is_done
 
   my $bool = $req->is_pending;
   my $bool = $req->is_done;
 
-Convenience accessors for the completion state.
+Convenience accessors for completion state.
 
 =head2 fh
 
   my $fh = $req->fh;
 
-Returns the in-progress filehandle while the request is pending, or undef after
-completion/cancel.
+Returns the in-progress filehandle while pending, or undef after completion.
 
 =head2 errno
 
   my $errno = $req->errno;
 
-Returns the last error number seen by the request (most useful after failure).
+Returns the last error number observed by the request.
 
 =head2 gai_error
 
   my $str = $req->gai_error;
 
-If hostname resolution via C<getaddrinfo> fails, this returns a stored string
-describing the resolver failure.
+If hostname resolution via C<getaddrinfo> fails, this returns the stored resolver
+failure string.
 
 =head1 CALLBACK BEHAVIOR
 
-Callbacks are invoked at most once.
-
-Before invoking a callback, the request tears down its internal watcher and
-timeout. This prevents double-callbacks and keeps re-entrant loop activity safe.
+Before invoking a callback, the request cancels its internal watcher and timeout.
+This prevents double-callbacks and keeps re-entrant loop activity safe.
 
 =head1 PERFORMANCE NOTES
 
@@ -564,24 +628,35 @@ timeout. This prevents double-callbacks and keeps re-entrant loop activity safe.
 
 =item * IP literals avoid getaddrinfo
 
-IPv4/IPv6 literals are detected via C<inet_pton> and do not call C<getaddrinfo>.
+IPv4/IPv6 literals do not call C<getaddrinfo>.
 
 =item * Hostnames may block
 
-Hostname resolution uses synchronous C<getaddrinfo> and may block. For strict
-nonblocking behavior in all cases, use sockaddr mode with a pre-resolved address
-or provide an IP literal in host/port mode.
+Hostname resolution is synchronous and may block. If you need strict nonblocking
+behavior, use sockaddr mode with a pre-resolved address or provide an IP literal.
 
 =item * Candidate fallback
 
-When multiple candidate sockaddrs are produced (for example, IPv6 then IPv4),
-Connect will try them in order until one connects or all fail.
+When multiple candidates exist (for example IPv6 then IPv4), Connect tries them
+in order until one succeeds or all fail.
 
 =back
 
 =head1 SEE ALSO
 
-L<Linux::Event>, L<Linux::Event::Stream>, L<Socket>
+L<Linux::Event> - core event loop
+
+L<Linux::Event::Listen> - server-side socket acquisition
+
+L<Linux::Event::Connect> - client-side socket acquisition
+
+L<Linux::Event::Fork> - asynchronous child processes
+
+L<Linux::Event::Clock> - high resolution monotonic clock utilities
+
+=head1 AUTHOR
+
+Joshua S. Day
 
 =head1 LICENSE
 
